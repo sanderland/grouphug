@@ -7,6 +7,10 @@ license = "Apache2"
 readme = "README.md"
 homepage = "https://github.com/sanderland/grouphug"
 keywords = ["transformers","language modelling","machine learning","classification"]
+[tool.poetry.group.dev.dependencies]
+poetry-kernel = "^0.1.2"
+intel-extension-for-pytorch = "^1.12.300"
+
 
 [tool.isort]
 profile = "black"

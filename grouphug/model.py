@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 from abc import ABC
@@ -30,6 +31,7 @@ from transformers import (
 )
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import ModelOutput
+from transformers.utils.import_utils import is_ipex_available
 
 from grouphug import DatasetFormatter
 from grouphug.config import (
@@ -124,10 +126,6 @@ class _BaseMultiTaskModel(ABC):
         # this is self.bert / self.roberta, and such
         setattr(self, self.base_model_prefix, AutoModel.from_config(config))
 
-    # @property
-    # def base_model(self):
-    #    return getattr(self, self.base_model_prefix)
-
     def get_mlm_head(self) -> Optional[LMHeadConfig]:
         for hc in self.head_configs:
             if isinstance(hc, LMHeadConfig):
@@ -206,26 +204,64 @@ class _BaseMultiTaskModel(ABC):
             "set_output_embeddings is not implemented, use tie weights."
         )  # in resizing embeddings?
 
+    # optimization
+    def optimize(self, tokenizer=None, jit=True,ipex=None, dtype=torch.float32, level="O1"):
+        """
+        Optimizes for inference
+
+        tokenizer:
+        jit:
+        ipex: None will try
+        dtype: for ipex
+        level: for ipex
+        """
+        tokenizer = tokenizer or self.tokenizer()
+        encoded = tokenizer('example text',return_tensors="pt")
+        input_names = []
+        for name in inspect.signature(self.base_model.forward).parameters:
+            if name not in encoded:
+                break
+            input_names.append(name)
+        tuple_input = tuple(encoded[name] for name in input_names)
+        print(len(tuple_input),'inputs',input_names)
+
+        optimized_model = self.base_model.eval()
+
+        if ipex is not False:
+            ipex_available = is_ipex_available()
+            if not ipex_available:
+                if ipex:
+                    raise ImportError("Using IPEX but IPEX is not installed.")
+                else:
+                    logger.warning("IPEX not installed, so skipping this optimization")
+            else:
+                import intel_extension_for_pytorch as ipex
+                optimized_model = ipex.optimize(optimized_model, dtype=dtype, level=level)
+
+        if jit:
+            optimized_model = torch.jit.trace(optimized_model, tuple_input ,strict=False)
+            optimized_model = torch.jit.freeze(optimized_model)
+        setattr(self, self.base_model_prefix, optimized_model)
+
     # inference methods
 
     def calculate_model_embeddings(self, prefix="", **kwargs):
         encoder = self.base_model
         # mlm just gives input ids, so we keep the other vars
-        no_mlm_prefix = "" if prefix == MASKED_PREFIX else ""
-        optional_args = dict(
+        no_mlm_prefix = "" if prefix == MASKED_PREFIX else prefix
+        optional_args = dict(  # TODO: save expected inputs etc
             attention_mask=kwargs.get(no_mlm_prefix + "attention_mask"),
             token_type_ids=kwargs.get(no_mlm_prefix + "token_type_ids"),
             position_ids=kwargs.get(no_mlm_prefix + "position_ids"),
         )
         optional_args = {k: v for k, v in optional_args.items() if v is not None}
-        return encoder(kwargs[prefix + INPUT_IDS_VAR], return_dict=True, **optional_args)  # not optional
+        return (encoder(kwargs[prefix + INPUT_IDS_VAR], **optional_args)['last_hidden_state'],)  # TODO: heads not [0] ?
 
     def forward(self, inference_only: bool = False, **kwargs):
         r"""Determines which heads can be run, and returns weighted loss over them along with individual head outputs
 
         Args:
-            inference_only: will run heads even when labels are missing, and return full details
-            return_embeddings: will return a dict in .prefix_to_embedding"""
+            inference_only: will run heads even when labels are missing, and return full details"""
         # Which heads can we infer with these args?
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         # which head can we run given the inputs and mode?
@@ -285,13 +321,18 @@ class _BaseMultiTaskModel(ABC):
         """Simply wraps variables in a list and passes to format_forward_batch for convenience"""
         return self.format_forward_batch(tokenizer=tokenizer, **{k: [v] for k, v in kwargs.items()})
 
-    def _tensorize(self, v: Any) -> Union[str, torch.Tensor]:
-        return v if isinstance(v, str) else torch.tensor(v, device=self.device)
-
     def format_forward_batch(self, tokenizer=None, **kwargs):
-        """If any kind of expected input_ids is passed, assumes data is formatter
+        """If any kind of expected input_ids is passed, assumes data is formatted
         kwargs: variables, either single data points or a batch
         """
+        device = self.device
+        def _tensorize(v: Any) -> Union[str, torch.Tensor]:
+            if isinstance(v,str):
+                return v
+            if isinstance(v,list) and isinstance(v[0],np.ndarray):
+                v = np.array(v)  # avoid torch warnings on lists of arrays
+            return torch.as_tensor(v,device=device)  # already tensors, and python lists and such
+
         if not any(p + INPUT_IDS_VAR in kwargs for hc in self.head_configs for p in hc.input_prefixes()):
             if not self.formatter:
                 raise ValueError("Expecting either input_ids, or a formatter present. Pass one to from_pretrained!")
@@ -300,7 +341,7 @@ class _BaseMultiTaskModel(ABC):
         else:
             data = kwargs
         model_vars = self.vars()
-        data = {k: self._tensorize(np.array(v)) for k, v in data.items() if k in model_vars}  # np array avoids warning
+        data = {k: _tensorize(v) for k, v in data.items() if k in model_vars}
         with torch.no_grad():
             return self.forward(inference_only=True, **data)
 
@@ -388,7 +429,7 @@ class _BaseMultiTaskModel(ABC):
                     formatter = DatasetFormatter.from_dict(json.load(f))
 
         return super().from_pretrained(
-            pretrained_model_name_or_path, head_configs=head_configs, formatter=formatter, *args, **kwargs
+            pretrained_model_name_or_path, head_configs=head_configs, formatter=formatter, return_dict=True, *args, **kwargs
         )
 
     def get_word_embeddings(self) -> torch.nn.Embedding:
