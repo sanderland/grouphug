@@ -77,6 +77,14 @@ class ModelInferenceError(Exception):
         self.batch = batch
 
 
+def _tensorize(v: Any, device) -> Union[str, torch.Tensor]:
+    if isinstance(v, str):
+        return v
+    if isinstance(v, list) and isinstance(v[0], np.ndarray):
+        v = np.array(v)  # avoid torch warnings on lists of arrays
+    return torch.as_tensor(v, device=device)  # already tensors, and python lists and such
+
+
 DEFAULT_IGNORE_MISSING = ["lm_head.lm_head", "lm_head.decoder.weight"]
 DEFAULT_IGNORE_SAVE = ["lm_head.decoder.weight"]
 
@@ -105,10 +113,10 @@ class _BaseMultiTaskModel(ABC):
         # cached convenience vars
         self._vars = None
 
-        # this is self.bert / self.roberta, and such
-        self._init_base_model(config)
+        self._init_base_model(config)  # this is self.bert / self.roberta, and such
+        self._init_base_model_inputs()
 
-        self.formatter = formatter
+        self.formatter = formatter or DatasetFormatter().tokenize()
         self.head_configs = self._create_heads(config, head_configs)
         self._active_heads = self.head_configs
         # each head is stored in either it's specified attribute, or in a ModuleDict
@@ -121,6 +129,16 @@ class _BaseMultiTaskModel(ABC):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def _init_base_model_inputs(self):
+        # we store what parameters from the tokenizer are expected by the base model
+        # this helps inference and optimization (where kwargs are not allowed)
+        encoded = self.tokenizer()("example", return_tensors="pt")
+        self.base_model_inputs = []
+        for name in inspect.signature(self.base_model.forward).parameters:
+            if name not in encoded:
+                break
+            self.base_model_inputs.append(name)
 
     def _init_base_model(self, config):  # does not have pooling layer option
         # this is self.bert / self.roberta, and such
@@ -173,7 +191,14 @@ class _BaseMultiTaskModel(ABC):
     # tokenizer helper
     def tokenizer(self, name_or_path=None, **kwargs):
         if self._tokenizer is None:
-            self._tokenizer = AutoTokenizer.from_pretrained(name_or_path or self.config._name_or_path, **kwargs)
+            try:
+                self._tokenizer = AutoTokenizer.from_pretrained(name_or_path or self.config._name_or_path, **kwargs)
+            except TypeError as e:  # some protobuf versions are not compatible and give errors on fast tokenizers
+                if kwargs.get("use_fast", True):
+                    logger.warning(f"Instantiating fast tokenizer failed, trying use_fast=False: {e}")
+                    return self.tokenizer(name_or_path, **{**kwargs, "use_fast": False})
+                else:
+                    raise
         return self._tokenizer
 
     # ...
@@ -204,28 +229,17 @@ class _BaseMultiTaskModel(ABC):
             "set_output_embeddings is not implemented, use tie weights."
         )  # in resizing embeddings?
 
-    # optimization
-    def optimize(self, tokenizer=None, jit=True,ipex=None, dtype=torch.float32, level="O1"):
+    def optimize(self, ipex=None, jit=True, dtype=torch.float32, level="O1"):
         """
-        Optimizes for inference
+        Optimizes base model for inference
 
-        tokenizer:
-        jit:
-        ipex: None will try
-        dtype: for ipex
-        level: for ipex
+        ipex: Optimize with intel_extension_for_pytorch. True will raise on failure, while None will warn, and False will skip this step.
+        jit: Optimize using torch script (trace, freeze).
+        dtype, level: for ipex
         """
-        tokenizer = tokenizer or self.tokenizer()
-        encoded = tokenizer('example text',return_tensors="pt")
-        input_names = []
-        for name in inspect.signature(self.base_model.forward).parameters:
-            if name not in encoded:
-                break
-            input_names.append(name)
-        tuple_input = tuple(encoded[name] for name in input_names)
-        print(len(tuple_input),'inputs',input_names)
-
         optimized_model = self.base_model.eval()
+        encoded = self.tokenizer()("example text", return_tensors="pt")
+        tuple_input = tuple(encoded[v] for v in self.base_model_inputs)
 
         if ipex is not False:
             ipex_available = is_ipex_available()
@@ -236,26 +250,26 @@ class _BaseMultiTaskModel(ABC):
                     logger.warning("IPEX not installed, so skipping this optimization")
             else:
                 import intel_extension_for_pytorch as ipex
-                optimized_model = ipex.optimize(optimized_model, dtype=dtype, level=level)
+
+                optimized_model = ipex.optimize(
+                    optimized_model, sample_input=tuple_input, conv_bn_folding=False, dtype=dtype, level=level
+                )
 
         if jit:
-            optimized_model = torch.jit.trace(optimized_model, tuple_input ,strict=False)
+            optimized_model = torch.jit.trace(optimized_model, tuple_input, strict=False)
             optimized_model = torch.jit.freeze(optimized_model)
         setattr(self, self.base_model_prefix, optimized_model)
 
     # inference methods
-
     def calculate_model_embeddings(self, prefix="", **kwargs):
-        encoder = self.base_model
-        # mlm just gives input ids, so we keep the other vars
-        no_mlm_prefix = "" if prefix == MASKED_PREFIX else prefix
-        optional_args = dict(  # TODO: save expected inputs etc
-            attention_mask=kwargs.get(no_mlm_prefix + "attention_mask"),
-            token_type_ids=kwargs.get(no_mlm_prefix + "token_type_ids"),
-            position_ids=kwargs.get(no_mlm_prefix + "position_ids"),
-        )
-        optional_args = {k: v for k, v in optional_args.items() if v is not None}
-        return (encoder(kwargs[prefix + INPUT_IDS_VAR], **optional_args)['last_hidden_state'],)  # TODO: heads not [0] ?
+        def prefix_var(var):
+            if prefix == MASKED_PREFIX and var != INPUT_IDS_VAR:
+                return var  # mlm collator just prefixes input ids, so we keep the other vars
+            else:
+                return prefix + var
+
+        args = [kwargs[prefix_var(v)] for v in self.base_model_inputs]
+        return self.base_model(*args)["last_hidden_state"]
 
     def forward(self, inference_only: bool = False, **kwargs):
         r"""Determines which heads can be run, and returns weighted loss over them along with individual head outputs
@@ -325,14 +339,6 @@ class _BaseMultiTaskModel(ABC):
         """If any kind of expected input_ids is passed, assumes data is formatted
         kwargs: variables, either single data points or a batch
         """
-        device = self.device
-        def _tensorize(v: Any) -> Union[str, torch.Tensor]:
-            if isinstance(v,str):
-                return v
-            if isinstance(v,list) and isinstance(v[0],np.ndarray):
-                v = np.array(v)  # avoid torch warnings on lists of arrays
-            return torch.as_tensor(v,device=device)  # already tensors, and python lists and such
-
         if not any(p + INPUT_IDS_VAR in kwargs for hc in self.head_configs for p in hc.input_prefixes()):
             if not self.formatter:
                 raise ValueError("Expecting either input_ids, or a formatter present. Pass one to from_pretrained!")
@@ -341,7 +347,8 @@ class _BaseMultiTaskModel(ABC):
         else:
             data = kwargs
         model_vars = self.vars()
-        data = {k: _tensorize(v) for k, v in data.items() if k in model_vars}
+        device = self.device
+        data = {k: _tensorize(v, device) for k, v in data.items() if k in model_vars}
         with torch.no_grad():
             return self.forward(inference_only=True, **data)
 
@@ -429,7 +436,12 @@ class _BaseMultiTaskModel(ABC):
                     formatter = DatasetFormatter.from_dict(json.load(f))
 
         return super().from_pretrained(
-            pretrained_model_name_or_path, head_configs=head_configs, formatter=formatter, return_dict=True, *args, **kwargs
+            pretrained_model_name_or_path,
+            head_configs=head_configs,
+            formatter=formatter,
+            return_dict=True,
+            *args,
+            **kwargs,
         )
 
     def get_word_embeddings(self) -> torch.nn.Embedding:
@@ -518,7 +530,7 @@ class AutoMultiTaskModel:
 
         Args:
             head_configs: model head configurations. Will try to load if omitted.
-            formatter: optional DatasetFormatter which will be saved with the model, and can be used to infer on non-formatted data. Will try to load if omitted.
+            formatter: optional DatasetFormatter which will be saved with the model, and can be used to infer on non-formatted data. Will try to load if omitted, and use a default tokenizer as a last resort.
             tokenizer: pass a tokenizer here to avoid it being created by the model when it is missing one.
             kwargs: passed to model init, always empty in current setup, but can be used for your own models
         """

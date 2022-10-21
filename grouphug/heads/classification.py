@@ -65,11 +65,10 @@ class ClassificationHead(ModelHead):
 
     def pool_embedding(self, embeddings, **kwargs):
         """Overwrite this method to change the pooling in the classification head"""
-        features = embeddings[0]  # up to this point it is still the dict output of roberta etc.
         if self.head_config.detached:
-            features = features.detach()
+            embeddings = embeddings.detach()
         if self.head_config.pooling_method in ["cls", "first"]:
-            return features[:, 0, :]  # take first token, typically <s> or [CLS]
+            return embeddings[:, 0, :]  # take first token, typically <s> or [CLS]
         if self.head_config.pooling_method == "last":  # last non-padded token
             input_ids: torch.Tensor = kwargs.get(f"{self.head_config.input_prefix}{INPUT_IDS_VAR}")
             if self.config.pad_token_id is None:  # take last non-pad token, usually <eos>
@@ -78,17 +77,19 @@ class ClassificationHead(ModelHead):
                 sequence_lengths = -1
             else:  # right padded, as is usual
                 sequence_lengths = torch.ne(input_ids, self.config.pad_token_id).sum(-1) - 1
-            return features[torch.arange(features.shape[0], device=features.device), sequence_lengths]
+            return embeddings[torch.arange(embeddings.shape[0], device=embeddings.device), sequence_lengths]
         else:
             attention_mask_col = f"{self.head_config.input_prefix}attention_mask"
             if attention_mask_col not in kwargs:
                 raise ValueError(f"mean or max pooling requires column {attention_mask_col}")
             attention_mask = kwargs[attention_mask_col]
-            input_mask_expanded = attention_mask.unsqueeze(-1).expand(features.size()).float()
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(embeddings.size()).float()
             if self.head_config.pooling_method == "mean":  # from huggingface docs
-                return torch.sum(features * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                return torch.sum(embeddings * input_mask_expanded, 1) / torch.clamp(
+                    input_mask_expanded.sum(1), min=1e-9
+                )
             elif self.head_config.pooling_method == "max":
-                return torch.max(features * input_mask_expanded, 1).values
+                return torch.max(embeddings * input_mask_expanded, 1).values
             else:
                 raise ValueError(f"Unknown pooling method {self.head_config.pooling_method}")
 

@@ -1,16 +1,9 @@
-import os
-
+import evaluate
 import numpy as np
-import torch
-
-from grouphug.config import IGNORE_INDEX
-from grouphug.model import ModelInferenceError
-
-os.environ["CUDA_VISIBLE_DEVICES"] = ""  # TODO: remove
-
 import pandas as pd
 import pytest
-from datasets import Dataset, load_metric
+import torch
+from datasets import Dataset
 from transformers import AutoTokenizer, TrainingArguments
 
 from grouphug import (
@@ -21,6 +14,8 @@ from grouphug import (
     LMHeadConfig,
     MultiTaskTrainer,
 )
+from grouphug.config import IGNORE_INDEX
+from grouphug.model import ModelInferenceError
 from grouphug.utils import np_json_dumps
 from tests.conftest import SMALL_MODEL, losses_not_nan
 
@@ -208,7 +203,7 @@ def test_train_eval_metrics(multiple_datasets, multiple_formatter):
             all_logits = (all_logits,)
             all_labels = (all_labels,)
         metrics = {}
-        accuracy_f = load_metric("accuracy")
+        accuracy_f = evaluate.load("accuracy")
         for logits, labels, hc in zip(all_logits, all_labels, heads):
             labels = labels.ravel()
             mask = labels != IGNORE_INDEX
