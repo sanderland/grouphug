@@ -38,6 +38,12 @@ def dataset_regress():
 
 
 @pytest.fixture
+def dataset_regress_int():
+    ds = Dataset.from_dict({"text": [" ".join(f"token{i}" for i in range(10)), "x y z"], "y": [3, 4]})
+    return ds
+
+
+@pytest.fixture
 def dataset_text_only():
     ds = Dataset.from_dict({"text": [f"the lazy dog jumps over the quick fox {i} times" for i in range(10)]})
     return ds

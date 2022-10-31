@@ -101,3 +101,9 @@ def test_single_dataset():
     assert "data" in data
     assert "input_ids" in data["data"]["train"].features
     assert "input_ids" in data["data"]["test"].features
+
+
+def test_encode_floats():  # tests if floats can be properly encoded, this had a datatype bug
+    example_data = Dataset.from_dict({"y": [float(3 + i // 3) for i in range(10)]})
+    data = DatasetFormatter().encode("y").apply(example_data, shuffle=False, test_size=0)
+    assert isinstance(data["data", "train"][0]["y"], int)

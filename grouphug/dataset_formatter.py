@@ -327,15 +327,16 @@ class DatasetFormatter:
                     old_oov_len = len(self.oov_texts)
                     #  new_fingerprint = update_fingerprint(old_fingerprint, op_name, ops_log)
                     remove_columns = list(self.drop_columns & set(dataset.features))
+                    # new_features = Features({k: feature_label_names.get(k,dataset.features[k]) for k in dataset.features}) # TODO: remove?
                     dataset_dict[ds_split] = dataset_dict[ds_split].map(
                         self._format_batch,
                         fn_kwargs={"tokenizer": tokenizer, "operations": self.operations},
                         batch_size=batch_size,
                         batched=True,
                         remove_columns=remove_columns,
+                        features=None,
                         **map_args,
                     )
-                    new_fingerprint = dataset_dict[ds_split]._fingerprint
                     new_oov = len(self.oov_texts) - old_oov_len
                     oov_message = f"{new_oov} texts with out-of-vocabulary (<unk>) tokens. " if new_oov else ""
                     # Fingerprint {new_fingerprint}
