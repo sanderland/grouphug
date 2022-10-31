@@ -312,3 +312,30 @@ def test_train_forgot_encode(dataset_multiclass_topics_star, training_args):
     )
     with pytest.raises(ModelInferenceError):
         trainer.train()
+
+
+def test_regress_ints(dataset_regress_int, training_args):
+    tokenizer = AutoTokenizer.from_pretrained(SMALL_MODEL)
+    fmt = DatasetFormatter().tokenize()
+    data = fmt.apply(dataset_regress_int, tokenizer=tokenizer, test_size=0)
+    training_args.evaluation_strategy = None
+
+    head_configs = [
+        ClassificationHeadConfig.from_data(
+            data,
+            labels_var="y",
+            pooling_method="last",
+            problem_type=ClassificationHead.REGRESSION,
+            classifier_hidden_size=3,
+        ),
+    ]
+    model = AutoMultiTaskModel.from_pretrained(SMALL_MODEL, head_configs, tokenizer=tokenizer, formatter=fmt)
+    trainer = MultiTaskTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        args=training_args,
+        train_data=data[:, "train"],
+    )
+    trainer.train()
+    result = model.predict(dict(text="blabla"))
+    assert result.keys() == {"y_predicted_value"}

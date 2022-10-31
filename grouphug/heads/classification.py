@@ -98,7 +98,7 @@ class ClassificationHead(ModelHead):
         if self.head_config.problem_type == self.REGRESSION:
             loss_fct = MSELoss()
             if self.num_labels == 1:
-                loss = loss_fct(logits.squeeze(), labels.squeeze())
+                loss = loss_fct(logits.squeeze(), labels.to(logits.dtype).squeeze())
             else:
                 loss = loss_fct(logits, labels)
         else:
