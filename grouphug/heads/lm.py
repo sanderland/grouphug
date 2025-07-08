@@ -78,9 +78,7 @@ class BaseLMHead(ModelHead):
 
     def _default_lm_logits(self, embeddings):
         """Used as default for MLM and CLM"""
-        features = embeddings[0]  # up to this point it is still the dict output of roberta etc.
-
-        x = self.dense(features)
+        x = self.dense(embeddings)
         x = gelu(x)
         x = self.layer_norm(x)
 
@@ -120,8 +118,7 @@ class BaseLMHead(ModelHead):
         self.discriminator_predictions = MTDPredictions(self.config)
 
     def get_mtd_logits(self, embeddings):
-        features = embeddings[0]  # up to this point it is still the dict output of roberta etc.
-        return self.discriminator_predictions(features)
+        return self.discriminator_predictions(embeddings)
 
     def mtd_loss(self, logits, labels):
         predict_mask = labels != IGNORE_INDEX
@@ -199,8 +196,7 @@ class BaseBertLMHead(BaseLMHead):
         self.predictions = self.HEAD_CLASS(self.config)
 
     def get_mlm_logits(self, embeddings):
-        features = embeddings[0]  # up to this point it is still the dict output of roberta etc.
-        return self.predictions(features)
+        return self.predictions(embeddings)
 
     def head_output_embeddings(self):
         if self.head_config.masked_language_modelling:
@@ -247,7 +243,7 @@ class DistilBertLMHead(BaseLMHead):  # from DistilBertForMaskedLM, which sticks 
         self.vocab_projector = nn.Linear(config.dim, config.vocab_size)
 
     def get_mlm_logits(self, embeddings):
-        hidden_states = embeddings[0]  # up to this point it is still the dict output of roberta etc.
+        hidden_states = embeddings
         prediction_logits = self.vocab_transform(hidden_states)  # (bs, seq_length, dim)
         prediction_logits = self.activation(prediction_logits)  # (bs, seq_length, dim)
         prediction_logits = self.vocab_layer_norm(prediction_logits)  # (bs, seq_length, dim)
@@ -288,7 +284,7 @@ class ElectraLMHead(BaseLMHead):  # from ElectraGeneratorPredictions
         self.generator_lm_head = nn.Linear(config.embedding_size, config.vocab_size)
 
     def get_mlm_logits(self, embeddings):
-        generator_hidden_states = embeddings[0]  # up to this point it is still the dict output
+        generator_hidden_states = embeddings
         hidden_states = self.dense(generator_hidden_states)
         hidden_states = get_activation("gelu")(hidden_states)
         hidden_states = self.LayerNorm(hidden_states)
@@ -310,8 +306,7 @@ class BaseGPTLMHead(BaseLMHead):  # GPT style models just have a simple projecti
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
     def get_clm_logits(self, embeddings):
-        features = embeddings[0]
-        return self.lm_head(features)
+        return self.lm_head(embeddings)
 
     def head_output_embeddings(self):  # used in MultiTaskModel#get_output_embeddings
         if self.head_config.causal_language_modelling:

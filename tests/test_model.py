@@ -1,7 +1,7 @@
 import pytest
 from transformers import AutoTokenizer
 
-from grouphug import AutoMultiTaskModel, LMHeadConfig
+from grouphug import AutoMultiTaskModel, DatasetFormatter, LMHeadConfig
 
 
 @pytest.mark.parametrize(
@@ -31,3 +31,13 @@ def test_model_init_mlm_new(base_model):
     assert info["unexpected_keys"] == []
     assert info["mismatched_keys"] == []
     assert info["error_msgs"] == []
+
+
+@pytest.mark.parametrize(
+    "base_model",
+    ["prajjwal1/bert-tiny", "google/electra-small-generator", "distilbert-base-uncased"],
+)
+def test_optimize(base_model):
+    model = AutoMultiTaskModel.from_pretrained(base_model, [LMHeadConfig()])
+    model.optimize()
+    assert isinstance(model.predict(dict(text="abc")), dict)
